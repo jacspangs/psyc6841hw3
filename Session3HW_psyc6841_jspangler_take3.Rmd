@@ -1,0 +1,393 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Setup 
+
+## Libraries & Conflicts
+
+```{r, echo = FALSE, include= FALSE, warning = FALSE, message = FALSE}
+
+suppressPackageStartupMessages({
+library(readxl)
+library(readr)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(knitr)
+library(RCurl)
+library(DT)
+library(modelr)
+library(broom)
+library(purrr)
+library(pROC)
+library(data.table)
+library(VIM)
+library(DT)
+library(gridExtra)
+library(caret)
+library(Metrics)
+library(randomForest)
+library(e1071)
+library(dtree)
+library(corrplot)
+library(DMwR2)
+library(rsample)
+library(skimr)
+library(psych)
+library(conflicted)
+library(tree)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(GGally)
+library(tidyquant)
+library(doParallel) 
+library(themis)
+library(tidylog, warn.conflicts = FALSE)
+})
+
+conflict_prefer("distinct", "dplyr")
+conflict_prefer("step_upsample", "recipes")
+conflict_prefer("tune", "tune")
+conflict_prefer("select", "dplyr")
+conflict_prefer("select_if", "dplyr")
+conflict_prefer("mutate_if", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("gather", "tidyr")
+conflict_prefer("tune", "tune")
+conflict_prefer("chisq.test", "stats")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("skewness", "PerformanceAnalytics")
+conflict_prefer("fit", "parsnip")
+conflict_prefer("rmse", "yardstick")
+conflict_prefer("map", "purrr")
+conflict_prefer("vip", "vip")
+
+for (f in getNamespaceExports("tidylog")) {
+    conflicted::conflict_prefer(f, "tidylog", quiet = TRUE)
+}
+```
+
+## Helper Functions 
+
+```{r}
+#From Matt Dancho DS4B 201
+
+plot_ggpairs <- function(data, color = NULL, density_alpha = 0.5) {
+   
+    color_expr <- enquo(color)
+   
+    if (rlang::quo_is_null(color_expr)) {
+       
+        g <- data %>%
+            ggpairs(lower = "blank")
+       
+    } else {
+       
+        color_name <- quo_name(color_expr)
+       
+        g <- data %>%
+            ggpairs(mapping = aes_string(color = color_name),
+                    lower = "blank", legend = 1,
+                    diag = list(continuous = wrap("densityDiag",
+                                                  alpha = density_alpha))) +
+            theme(legend.position = "bottom")
+    }
+   
+    return(g)
+   
+}
+
+#From Matt Dancho DS4B 201
+plot_hist_facet <- function(data, fct_reorder = FALSE, fct_rev = FALSE,
+                            bins = 10, fill = palette_light()[[3]], color = "white", ncol = 5, scale = "free") {
+   
+    data_factored <- data %>%
+        mutate_if(is.character, as.factor) %>%
+        mutate_if(is.factor, as.numeric) %>%
+        gather(key = key, value = value, factor_key = TRUE)
+   
+    if (fct_reorder) {
+        data_factored <- data_factored %>%
+            mutate(key = as.character(key) %>% as.factor())
+    }
+   
+    if (fct_rev) {
+        data_factored <- data_factored %>%
+            mutate(key = fct_rev(key))
+    }
+   
+    g <- data_factored %>%
+        ggplot(aes(x = value, group = key)) +
+        geom_histogram(bins = bins, fill = fill, color = color) +
+        facet_wrap(~ key, ncol = ncol, scale = scale) +
+        theme_tq()
+   
+    return(g)
+   
+}
+```
+
+# Load & Prep data
+
+```{r}
+Data <- read_excel("C:/Users/Jaclyn/Desktop/LearningR/AdvAnalytics/00_data/WA_Fn-UseC_-HR-Employee-Attrition.xlsx")
+```
+
+```{r}
+#ADD ID
+Data <- Data %>%
+  mutate(ID = row_number()) %>%
+  select(ID, EmployeeNumber, everything())
+```
+
+```{r}
+#ATTRITION = FACTOR
+Data <- Data %>%
+  mutate(Attrition = as.factor(Attrition))
+```
+
+```{r}
+#SPLIT DATA
+set.seed(76)
+
+data_split <- initial_split(Data, prop = 0.75, strata = "Attrition")
+
+train_data <- training(data_split)
+
+test_data <- testing(data_split)
+
+tabyl(train_data$Attrition)
+
+tabyl(test_data$Attrition)
+```
+
+```{r}
+#10 FOLDS OF DATA FOR LATER
+set.seed(76)
+cv_folds <- vfold_cv(train_data, v = 10, strata = "Attrition")
+```
+
+# Recipe, Model, Workflow
+
+Create recipe 
+
+```{r}
+set.seed(76) #setting seed here because I think step_upsample may need it.
+
+recipe_obj <- recipe(Attrition ~ ., data = train_data) %>%
+  update_role(ID, EmployeeNumber, new_role = "ID") %>%
+  step_mutate(JobLevel = factor(JobLevel)) %>% 
+    step_mutate(StockOptionLevel = factor(StockOptionLevel)) %>% 
+    step_YeoJohnson(YearsSinceLastPromotion, 
+                    PerformanceRating,
+                    YearsAtCompany,
+                    MonthlyIncome,
+                    TotalWorkingYears,
+                    NumCompaniesWorked,
+                    DistanceFromHome,
+                    YearsInCurrentRole,
+                    YearsWithCurrManager,
+                    PercentSalaryHike) %>%
+    step_center(all_numeric()) %>%
+    step_scale(all_numeric()) %>%
+    step_nzv(all_numeric()) %>% 
+    step_zv(all_predictors()) %>% 
+    themis::step_downsample(all_outcomes(), skip = TRUE) %>% 
+    step_dummy(all_nominal(), -all_outcomes())
+
+recipe_obj
+```
+
+Create Model 
+
+```{r}
+ridge_spec <-   # specify that the model is a logistic regression
+  logistic_reg(penalty = tune(), mixture = 0) %>%
+  set_engine("glmnet") %>%   # choose either the continuous regression or binary classification mode
+  set_mode("classification")
+
+ridge_spec
+```
+
+Put it all together in a workflow.
+
+```{r}
+# set the workflow
+ridge_wflow <- workflow() %>%
+  add_recipe(recipe_obj) %>% # add the recipe
+  add_model(ridge_spec) # add the model
+
+ridge_wflow
+```
+
+```{r}
+wflow_param <- 
+  workflow() %>% 
+  add_recipe(recipe_obj) %>% 
+  add_model(ridge_spec) %>% 
+  dials::parameters()
+wflow_param
+```
+
+
+## Fit the Model (glm)
+
+
+```{r}
+ridge_fit <- fit(ridge_wflow, data = train_data)
+```
+
+
+```{r}
+ridge_fit$fit
+```
+
+
+```{r}
+tidy(ridge_fit, penalty = 4)
+```
+
+
+# Cross- Validation (glm)
+
+```{r}
+set.seed(76)
+#Fit with formula and model
+fit_resamples(ridge_wflow,
+              model = ridge_spec,
+              resamples = cv_folds) %>%
+  collect_metrics()
+```
+
+
+
+Accuracy of .78 and AUC of .83. Not great. This accuracy is no better than our baseline of 84%
+
+## Tuning Grid
+We started with an open tuning parameter. We'll now use cross validation to find the best penalty value before finalizing the model. 
+
+```{r Penalty Grid}
+# penalty_grid <- grid_regular(penalty(range = c(-10, 10)), levels = 50)
+# penalty_grid
+
+#I don't really understand how to choose a range, but I know we should start large-ish and hone in. So starting with a -10to10 range. 
+
+penalty_grid <- grid_regular(penalty(range = c(-5, 5)), levels = 50)
+penalty_grid
+```
+
+Visualize residuals
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(76)
+
+lasso_grid <- tune_grid(lasso_wflow,
+                        resamples = cv_folds,
+                        grid = penalty_grid
+)
+
+autoplot(lasso_grid) #visualize
+
+collect_metrics(lasso_grid) #table of results
+
+```
+
+
+```{r}
+set.seed(76)
+
+lasso_results <- fit_resamples(lasso_wflow, 
+                               lasso_spec, 
+                               resamples = cv_folds) %>%
+  collect_metrics()
+  # pull(.notes)
+```
+
+
+```{r}
+lasso_results
+```
+
+
+### Fit the Tuned Model 
+
+Now we fit the model with the best penalty. I'm choosing `roc` from a hunch. I don't really understand how to analyze and choose between the two. Some things I read make me think `roc` would be more appropriate for an unbalanced classification problem...
+
+```{r}
+best_penalty <- select_best(lasso_grid, metric = "accuracy") 
+best_penalty
+
+best_penalty_roc <- select_best(lasso_grid, metric = "roc_auc") 
+best_penalty_roc
+```
+
+### Finalize Model 
+
+```{r Finalization}
+lasso_final <- finalize_workflow(lasso_wflow, best_penalty_roc)
+
+lasso_final_fit <- parsnip::fit(lasso_final, data = Data_train)
+
+lasso_final_fit
+# lasso_final_fit$fit
+```
+
+### Evaluate / Test the Model 
+
+```{r}
+augment(lasso_final_fit, new_data = Data_test) %>%
+  rsq(truth = Attrition, estimate = .pred)
+```
+
+
+```{r}
+logit_last_fit <- logit_wflow_tune %>%   # fit on the training set and evaluate on the test set
+  last_fit(Data_split)
+```
+
+```{r}
+logit_last_fit
+```
+```{r}
+logit_test_performance <- logit_last_fit %>% collect_metrics()
+logit_test_performance
+```
+
+Plot the ROC Curve
+
+```{r}
+logit_test_predictions %>%
+  roc_curve(Attrition, .pred_No) %>% #Originally, was "pred_Yes" and curve was inverted
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) 
+```
+
+A quick visual of the variables that are most important in our model. 
+
+```{r Predictors Visualized}
+library(vip)
+
+lasso_final_fit %>%
+  parsnip::fit(Data_train) %>%
+  pull_workflow_fit() %>%
+  vip::vi(lambda = best_penalty_roc$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = forcats::fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```

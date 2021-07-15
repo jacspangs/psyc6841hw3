@@ -1,0 +1,620 @@
+---
+title: "PSYC6841 - Session 3 Homework - Jaclyn Spangler"
+output: html_notebook
+---
+
+# File Setup 
+
+## Libraries 
+
+```{r, echo = FALSE, include= FALSE, warning = FALSE, message = FALSE}
+
+suppressPackageStartupMessages({
+library(readxl)
+library(readr)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(knitr)
+library(RCurl)
+library(DT)
+library(modelr)
+library(broom)
+library(purrr)
+library(pROC)
+library(data.table)
+library(VIM)
+library(DT)
+library(gridExtra)
+library(caret)
+library(Metrics)
+library(randomForest)
+library(e1071)
+library(dtree)
+library(corrplot)
+library(DMwR2)
+library(rsample)
+library(skimr)
+library(psych)
+library(conflicted)
+library(tree)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(GGally)
+library(tidyquant)
+library(doParallel) 
+library(themis)
+library(tidylog, warn.conflicts = FALSE)
+})
+
+conflict_prefer("distinct", "dplyr")
+conflict_prefer("step_upsample", "recipes")
+conflict_prefer("tune", "tune")
+conflict_prefer("select", "dplyr")
+conflict_prefer("select_if", "dplyr")
+conflict_prefer("mutate_if", "dplyr")
+conflict_prefer("mutate", "dplyr")
+conflict_prefer("gather", "tidyr")
+conflict_prefer("tune", "tune")
+conflict_prefer("chisq.test", "stats")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("skewness", "PerformanceAnalytics")
+conflict_prefer("fit", "parsnip")
+conflict_prefer("rmse", "yardstick")
+conflict_prefer("map", "purrr")
+conflict_prefer("vip", "vip")
+
+for (f in getNamespaceExports("tidylog")) {
+    conflicted::conflict_prefer(f, "tidylog", quiet = TRUE)
+}
+```
+
+
+### Helper functions
+
+```{r}
+#From Matt Dancho DS4B 201
+plot_hist_facet <- function(data, fct_reorder = FALSE, fct_rev = FALSE, 
+                            bins = 10, fill = palette_light()[[3]], color = "white", ncol = 5, scale = "free") {
+    
+    data_factored <- data %>%
+        mutate_if(is.character, as.factor) %>%
+        mutate_if(is.factor, as.numeric) %>%
+        gather(key = key, value = value, factor_key = TRUE) 
+    
+    if (fct_reorder) {
+        data_factored <- data_factored %>%
+            mutate(key = as.character(key) %>% as.factor())
+    }
+    
+    if (fct_rev) {
+        data_factored <- data_factored %>%
+            mutate(key = fct_rev(key))
+    }
+    
+    g <- data_factored %>%
+        ggplot(aes(x = value, group = key)) +
+        geom_histogram(bins = bins, fill = fill, color = color) +
+        facet_wrap(~ key, ncol = ncol, scale = scale) + 
+        theme_tq()
+    
+    return(g)
+    
+}
+```
+
+## Loading Data 
+
+IBM HR Attrition Data
+
+```{r}
+library(readxl)
+Data <- read_excel("C:/Users/Jaclyn/Desktop/LearningR/AdvAnalytics/00_data/WA_Fn-UseC_-HR-Employee-Attrition.xlsx")
+colnames(Data)
+
+Data <- as.data.frame(unclass(Data)) #Change all strings from Character to Factor
+#From: https://stackoverflow.com/questions/20637360/convert-all-data-frame-character-columns-to-factors
+
+str(Data)
+```
+
+
+```{r}
+#Moving Employee Number ID column to front of data set, keeping it as an ID variable. Also moving Attrition as Outcome to the 2nd column just cause it's cleaner and I like it there.
+Data <- Data %>%
+  select(EmployeeNumber, Attrition, everything())
+
+colnames(Data)
+```
+
+
+# Exploratory Data Analysis 
+
+Since we're using the same data we used in the Class 3 session, I'm opting to exclude most of the exploratory data analysis. Some key considerations that we found when exploring the data in class: 
+
+- Observations: 1,470 with Variables: 35
+
+- There are no duplicates and no missing values.
+
+- Class Label is Attrition with 1233 'No' and 237 'Yes'. Our data set is unbalanced and we'll have to pay attention to this. 
+
+- BusinessTravel, Department, EducationField, Gender, jobRole, MaritalStatus and OverTime are categorical data and other variables are continuous.
+
+- Employee Number is an identifier variable
+
+- Three variables in our dataset do not vary between observations. Employee Count value for all observations is "1";  Over 18 value for all observations is "Y"; Standard Hours for all observations is "80". Because we do not have additional context for these variables and cannot guess if they'll be useful in future modeling, we'll remove them for our purposes. 
+
+```{r}
+#Data set with EmployeeCount, Over18, StandardHours removed
+# Data <- Data %>% dplyr::select(-EmployeeCount, -Over18, -StandardHours)
+
+#Note to self from later in nb-- I didn't really need to remove ^^these variables from the Data set. They will be dropped in recipe preprocessing using the zero variance filter. Something to remember for next time... 
+#step_zv(all_predictors()) %>% #looking for zero variance
+```
+
+
+
+```{r}
+skim(Data)
+```
+
+
+```{r}
+# View a pretty table of the data
+
+# For some reason, the knitr::kable table messes with my ability to scroll through my notebook. Commenting out while working in notebook to avoid annoyance.
+# Data %>% 
+#   head() %>% 
+#   knitr::kable()
+```
+
+# Data Preprocessing
+
+Seeking to follow these steps to preprocess data, using recipes. 
+
+Steps 0 and 1 are unnecessary for this data set, as EDA let us know we don't have duplicates or missingness.
+
+0. Check for duplicates!!
+1. Impute missing data
+2. Handle factor levels
+3. Individual transformations for skewness and other issues
+4. Discretize (if needed and if you have no other choice) #aka binning
+5. Create dummy variables
+6. Create interactions
+7. Normalization steps (center, scale, range, etc)
+8. Multivariate transformation (e.g. PCA, spatial sign, etc)
+
+
+## Handle Factor Levels
+
+```{r}
+#Check for discrete variables - may need to consider dummy coding for these variables and check if ordering is appropriate (i.e., should the dummy code of 1 - 2 - 3 indicate that some value is "worth" more or less?)
+Data %>%
+    select_if(is.character) %>%
+    map_df(~ unique(.) %>% length()) %>% # tries to turn it into a df instead of a list
+    gather() %>%
+    arrange(value) %>%
+    filter(value <= 10) #probably discrete if less than 10
+
+Data %>%
+    select_if(is.numeric) %>%
+    map_df(~ unique(.) %>% length()) %>% # tries to turn it into a df instead of a list
+    gather() %>%
+    arrange(value) %>%
+    filter(value <= 10) #probably discrete if less than 10
+```
+
+```{r}
+Data %>%
+    select_if(is.character) %>%
+    map(unique) #from purrr -- shows us all of the values available for our character data
+
+#Changed `BusinessTravel` to a factor below. If you come back to this chunk and run it again, we've already fixed that, so you won't get the same result.
+```
+
+`BusinessTravel` appears to be the only character data that may need to become a factor. Given EDA in class, we know that more travel or less travel has some relationship to attrition.
+
+```{r}
+Data %>%
+  distinct(BusinessTravel)
+```
+
+Using the same technique we tested in class, we'll change `BusinessTravel` to a factor and order the levels from `Non-Travel` to `Travel_Frequently`.
+
+We also turn `Attrition` into a factor, since it is the outcome variable and this will likely be necessary when working with the modeling code.
+
+```{r Mutating Factors}
+Data <- Data %>%
+  mutate(BusinessTravel = factor(BusinessTravel,
+                                 levels = c("Non-Travel",
+                                            "Travel_Rarely",
+                                            "Travel_Frequently")))  %>%
+   mutate(Attrition = as.factor(Attrition))
+```
+
+Double check our work:
+
+```{r}
+glimpse(Data)
+```
+
+
+## Split the Data
+
+Creating Training & Testing data splits. Our data is unbalanced with relatively few examples of the predicted variable, Attrition. We'll take care to split the data in such a way that % Attrition is equally represented in each data set. 
+
+We're using the default split of 75/25 for Training-Test split. 
+
+(This step would need to be done before imputing, if we'd had any missing data)
+
+```{r}
+## Setting seed
+set.seed(13)
+
+## Generate split
+Data_split <- initial_split(Data, strata = "Attrition")
+
+## Printing the function gives us <Num Rows in Training Set/Num Rows in Testing Set/Total Num Rows>
+Data_split
+```
+
+```{r}
+# Setting seed
+set.seed(13)
+
+#Creating Training & Test sets from our Split data 
+Data_train <- training(Data_split)
+Data_test <- testing(Data_split)
+
+# For some reason, the knitr::kable table messes with my ability to scroll through my notebook. Commenting out while working in notebook to avoid annoyance.
+# Data_train %>%
+#   head() %>%
+#   knitr::kable()
+```
+
+
+
+```{r}
+#Double check Attrition rate was properly split across data sets. 
+tabyl(Data$Attrition)
+tabyl(Data_train$Attrition)
+tabyl(Data_test$Attrition)
+
+```
+
+Our training and test sets look properly apportioned of Attrition data.
+
+
+### Cross Validation V-Folds creation
+
+Now to go ahead and create our folds to use in modeling later.
+
+```{r}
+set.seed(13)
+cv_folds <- vfold_cv(Data_train, v = 10, strata = "Attrition") #For later.
+```
+
+### Individual Transformations for Skewness
+
+```{r}
+#Understand skewness of predictor variables to decide on individual transformations
+Data_train %>%
+    select_if(is.numeric) %>%
+    map_df(PerformanceAnalytics::skewness) %>% #clean this up - add to conflict chunk
+    gather(factor_key = TRUE) %>%
+    arrange(desc(value))
+```
+
+```{r}
+#Taking just the skewed predictor variables greater than .90
+skewed_feature_names <- Data_train %>%
+    select_if(is.numeric) %>%
+    map_df(PerformanceAnalytics::skewness) %>%
+    gather(factor_key = TRUE) %>%
+    arrange(desc(value)) %>%
+    filter(value >= 0.9) %>% #decided on this number by dropoff to next lowest value
+    pull(key) %>%
+    as.character()
+```
+
+
+```{r}
+#Plotting skewed variables for further inspection
+conflict_prefer("tune", "tune")
+Data_train %>%
+    select(skewed_feature_names) %>%
+    plot_hist_facet()
+```
+
+Ok, it looks like `JobLevel` and `StockOptionLevel` may actually be factors.
+
+```{r}
+#Need to remove 2 of the features
+!skewed_feature_names %in% c("JobLevel", "StockOptionLevel")
+
+skewed_feature_names <- Data_train %>%
+    select_if(is.numeric) %>%
+    map_df(PerformanceAnalytics::skewness) %>%
+    gather(factor_key = TRUE) %>%
+    arrange(desc(value)) %>%
+    filter(value >= 0.9) %>% #decided on this number by dropoff to next lowest value and visual inspection of graph
+    filter(!key %in% c("JobLevel", "StockOptionLevel")) %>%
+    pull(key) %>%
+    as.character()
+
+```
+
+```{r}
+factor_names <- c("JobLevel", "StockOptionLevel")
+
+Levels <- c("0", "1", "2", "3", "4", "5") #setting factor levels up to 5 to match what we saw in the graph of JobLevel and StockOptionLevel
+```
+
+
+
+########################################################################################################################################################################################################################################################################################################################################
+
+# Lasso Modeling
+
+### Recipe & Workflow creation
+
+Now, we'll build a recipe that includes the remainder or our data preprocessing steps. 
+```{r Recipe}
+
+recipe_attrit <- 
+  recipe(formula = Attrition ~ ., data = Data_train) %>%
+  update_role(EmployeeNumber, new_role = "ID") %>% #Don't want EmployeeNumber to be a predictor variable. Keeping it in dataset for convenience of unique ID  
+  step_mutate(JobLevel = factor(JobLevel)) %>% 
+  step_mutate(StockOptionLevel = factor(StockOptionLevel)) %>%
+  step_YeoJohnson(YearsSinceLastPromotion, #Yeo all the numerics
+                  PerformanceRating,
+                  YearsAtCompany,
+                  MonthlyIncome,
+                  TotalWorkingYears,
+                  NumCompaniesWorked,
+                  DistanceFromHome,
+                  YearsInCurrentRole,
+                  YearsWithCurrManager,
+                  PercentSalaryHike) %>%
+  step_normalize(all_numeric(), -all_outcomes()) %>%  #this should replace both Center & scale.
+  step_nzv(all_predictors()) %>% #Remove numeric predictors near zero variance. Using "nearzero" here because of table in Kuhn, p.550. This step should remove the variables I was going to manually remove earlier in notebook.
+  themis::step_upsample(all_outcomes(), skip = TRUE, seed = 13) %>% #upsampling to account for unbalance
+  step_dummy(all_nominal(), -all_outcomes()) 
+  
+# Attrition_prep <- Attrition_rec %>% prep(strings_as_factors = FALSE) --Don't need this, but a nice thing to remember. If our ID column was of type Character rather than numeric/integer, this bit would help remedy
+
+recipe_attrit
+```
+
+<!-- ### Getting my bearings (glm) -->
+
+<!-- I couldn't understand some of the differences between the Class 3 notebook we worked through and the ISLR Lab 6 that went over Lasso models. Needed to see the next several chunks in action to get some things straight in my head. Namely - engine = "glm" vs "glmnet" is an important clarification between continuous or binary regression. It changes the output of the recipe and workflow models and some of the steps we take for tuning and visualization won't apply for both methods, since the output matrices and tables have different columns /sets of data. <-- Not well stated, but well enough that I can understand what I mean later.  -->
+
+<!-- ```{r} -->
+<!-- logit_spec <-   # specify that the model is a logistic regression -->
+<!--   logistic_reg(penalty = 1, mixture = 1) %>% -->
+<!--   set_engine("glm") %>%   # choose either the continuous regression or binary classification mode -->
+<!--   set_mode("classification") -->
+
+<!-- logit_spec -->
+<!-- ``` -->
+
+<!-- Put it all together in a workflow. -->
+
+<!-- ```{r} -->
+<!-- # set the workflow -->
+<!-- logit_wflow <- workflow() %>% -->
+<!--   add_recipe(recipe_attrit) %>% # add the recipe -->
+<!--   add_model(logit_spec) # add the model -->
+
+<!-- logit_wflow -->
+<!-- ``` -->
+
+<!-- ### Fit the Model (glm) -->
+
+
+<!-- ```{r} -->
+<!-- logit_fit <- fit(logit_wflow, data = Data_train) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- logit_fit$fit -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- tidy(logit_fit) %>% -->
+<!--   arrange(desc(abs(statistic))) -->
+<!-- ``` -->
+<!-- ### Cross- Validation (glm) -->
+
+<!-- ```{r} -->
+<!-- set.seed(13) -->
+<!-- #Fit with formula and model -->
+<!-- fit_resamples( -->
+<!--   logit_wflow, -->
+<!--   model = logit_spec, -->
+<!--   resamples = cv_folds -->
+<!-- ) -->
+<!-- ``` -->
+
+
+
+<!-- ```{r} -->
+<!-- set.seed(13) -->
+<!-- fit_resamples(logit_wflow, -->
+<!--               logit_spec, -->
+<!--               resamples = cv_folds) %>% -->
+<!--   collect_metrics() -->
+<!-- ``` -->
+
+<!-- Accuracy of .80 and AUC of .86. Not great. This accuracy is no better than our baseline of 84% -->
+
+### Tuning (glmnet --> switching to a continuous regression approach)
+
+After cross-validation shows our accuracy is not great with an arbitrarily chosen penalty, we need to take steps to tune the model. We'll use an open tuning parameter and then find a best value for the penalty through a grid cross-validation.
+
+```{r}
+lasso_spec <-   # new object with a penalty of `tune()`
+  logistic_reg(penalty = tune(), mixture = 1) %>%   
+  set_engine("glmnet") %>%   # choosing continuous vs binary classification mode
+  set_mode("classification")
+
+lasso_spec
+```
+
+Put it all together in a workflow.
+
+```{r}
+# set the workflow
+lasso_wflow <- workflow() %>%     
+  add_recipe(recipe_attrit) %>% # add the recipe
+  add_model(lasso_spec) # add the model
+
+lasso_wflow
+```
+
+
+```{r}
+lasso_fit <- fit(lasso_wflow, data = Data_train)
+# lasso_fit$fit
+```
+
+
+```{r}
+tidy(lasso_fit, penalty = -100)
+```
+
+We started with an open tuning parameter. We'll now use cross validation to find the best penalty value before finalizing the model. 
+
+```{r Penalty Grid}
+penalty_grid <- grid_regular(penalty(range = c(-10, 10)), levels = 50)
+penalty_grid
+
+#I don't really understand how to choose a range, but I know we should start large-ish and hone in. So starting with a -10to10 range. 
+# 
+# penalty_grid <- grid_regular(penalty(range = c(-5, 5)), levels = 50)
+# penalty_grid
+
+```
+
+
+
+
+```{r}
+set.seed(13)
+lasso_tune_results <- fit_resamples(lasso_wflow, 
+                                    lasso_spec,
+                                    resamples = cv_folds) %>% 
+  #collect_metrics()
+   pull(.notes)
+
+```
+```{r}
+extract_model(lasso_wflow)
+```
+
+
+### Fit the Tuned Model 
+
+Now we fit the model with the best penalty. I'm choosing `roc` from a hunch. I don't really understand how to analyze and choose between the two. Some things I read make me think `roc` would be more appropriate for an unbalanced classification problem...
+
+```{r}
+best_penalty <- select_best(lasso_grid, metric = "accuracy") 
+best_penalty
+
+best_penalty_roc <- select_best(lasso_grid, metric = "roc_auc") #Notice how a different penalty value is assigned "best". Know your metrics, when do use them, why to use them, and for which audiance to use them!
+best_penalty_roc
+```
+
+```{r Finalization}
+lasso_final <- finalize_workflow(logit_wflow_tune, best_penalty_roc)
+
+lasso_final_fit <- parsnip::fit(lasso_final, data = Data_train)
+
+lasso_final_fit
+# lasso_final_fit$fit
+```
+
+
+```{r}
+augment(lasso_final_fit, new_data = Data_test) %>%
+  rsq(truth = Attrition, estimate = .pred)
+```
+
+Something is going horribly wrong with this model and I've tried a lot of ways to fix it. I'm stuck. 
+
+
+```{r}
+logit_last_fit <- logit_wflow_tune %>%   # fit on the training set and evaluate on the test set
+  last_fit(Data_split)
+```
+
+```{r}
+logit_last_fit
+```
+```{r}
+logit_test_performance <- logit_last_fit %>% collect_metrics()
+logit_test_performance
+```
+Plot the ROC Curve
+
+```{r}
+logit_test_predictions %>%
+  roc_curve(Attrition, .pred_No) %>% #Originally, was "pred_Yes" and curve was inverted
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) 
+```
+
+A quick visual of the variables that are most important in our model. 
+
+```{r Predictors Visualized}
+library(vip)
+
+lasso_final_fit %>%
+  parsnip::fit(Data_train) %>%
+  pull_workflow_fit() %>%
+  vip::vi(lambda = best_penalty_roc$penalty) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = forcats::fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+########################################################################################################################################################################################################################################################################################################################################
